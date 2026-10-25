@@ -1,3 +1,4 @@
+```yaml
 name: Build Android APK
 
 on:
@@ -29,11 +30,13 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: '12266719'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: true
 
       - name: Install Android SDK packages
         run: |
           yes | sdkmanager --licenses
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Build debug APK
         run: gradle assembleDebug
@@ -44,3 +47,4 @@ jobs:
           name: LeitorCodigoBarras-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+```

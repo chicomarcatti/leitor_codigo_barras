@@ -42,8 +42,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: ArrayAdapter<String>
     private lateinit var cameraExecutor: ExecutorService
     private var camera: Camera? = null
-    private var lastCode = ""
-    private var lastAnyBarcodeAt = 0L
+    // Confirma a mesma leitura em vários quadros antes de registrar.
+    private var candidateCode = ""
+    private var candidateFormat = Barcode.FORMAT_UNKNOWN
+    private var candidateHits = 0
+    private var lastSeenBarcodeAt = 0L
+    private var lastAcceptedCode = ""
+    private var lastAcceptedAt = 0L
     private var scanning = false
     private var torchOn = false
     private var countMode = false
@@ -187,8 +192,7 @@ class MainActivity : AppCompatActivity() {
             val options = BarcodeScannerOptions.Builder().setBarcodeFormats(
                 Barcode.FORMAT_EAN_13, Barcode.FORMAT_EAN_8, Barcode.FORMAT_UPC_A,
                 Barcode.FORMAT_UPC_E, Barcode.FORMAT_CODE_128, Barcode.FORMAT_CODE_39,
-                Barcode.FORMAT_CODE_93, Barcode.FORMAT_ITF, Barcode.FORMAT_CODABAR,
-                Barcode.FORMAT_DATA_MATRIX, Barcode.FORMAT_PDF417, Barcode.FORMAT_AZTEC
+                Barcode.FORMAT_CODE_93, Barcode.FORMAT_ITF, Barcode.FORMAT_CODABAR
             ).build()
             val scanner = BarcodeScanning.getClient(options)
             val analysis = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
@@ -198,16 +202,40 @@ class MainActivity : AppCompatActivity() {
                 val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
                 scanner.process(image).addOnSuccessListener { barcodes ->
                     if (scanning) return@addOnSuccessListener
-                    val barcode = barcodes.firstOrNull { !it.rawValue.isNullOrBlank() }
-                    val value = barcode?.rawValue?.trim()
                     val now = System.currentTimeMillis()
-                    if (!value.isNullOrBlank()) {
-                        if (value != lastCode && now - lastAnyBarcodeAt > 250) {
-                            lastCode = value
-                            runOnUiThread { addScannedCode(value, barcode?.format ?: Barcode.FORMAT_UNKNOWN) }
+                    // Escolhe somente códigos que já passam pela validação matemática/formato.
+                    val barcode = barcodes.firstOrNull { item ->
+                        val raw = item.rawValue?.trim()
+                        !raw.isNullOrBlank() && isValidBarcode(raw, item.format)
+                    }
+                    val value = barcode?.rawValue?.trim()
+                    if (!value.isNullOrBlank() && barcode != null) {
+                        lastSeenBarcodeAt = now
+                        if (value == candidateCode && barcode.format == candidateFormat) {
+                            candidateHits++
+                        } else {
+                            candidateCode = value
+                            candidateFormat = barcode.format
+                            candidateHits = 1
                         }
-                        lastAnyBarcodeAt = now
-                    } else if (now - lastAnyBarcodeAt > 900) lastCode = ""
+
+                        // Exige 3 quadros consecutivos iguais; não registra o mesmo item
+                        // repetidamente enquanto ele permanece diante da câmera.
+                        val alreadyAcceptedRecently = value == lastAcceptedCode && now - lastAcceptedAt < 1500
+                        if (candidateHits >= 3 && !alreadyAcceptedRecently &&
+                            (value != lastAcceptedCode || now - lastAcceptedAt >= 1500)) {
+                            lastAcceptedCode = value
+                            lastAcceptedAt = now
+                            candidateHits = 0
+                            runOnUiThread { addScannedCode(value, barcode.format) }
+                        }
+                    } else if (now - lastSeenBarcodeAt > 900) {
+                        candidateCode = ""
+                        candidateFormat = Barcode.FORMAT_UNKNOWN
+                        candidateHits = 0
+                        lastAcceptedCode = ""
+                        lastAcceptedAt = 0L
+                    }
                 }.addOnCompleteListener { imageProxy.close() }
             }
             try {
@@ -262,12 +290,12 @@ class MainActivity : AppCompatActivity() {
             AlertDialog.Builder(this).setTitle("Quantidade do item")
                 .setMessage("Código: $code")
                 .setView(quantityInput)
-                .setNegativeButton("Cancelar") { _, _ -> lastCode = "" }
+                .setNegativeButton("Cancelar") { _, _ -> candidateCode = ""; candidateHits = 0 }
                 .setPositiveButton("Registrar") { _, _ ->
                     val quantity = quantityInput.text.toString().toIntOrNull()
                     if (quantity == null || quantity < 1 || quantity > 100000) {
                         Toast.makeText(this, "Informe uma quantidade entre 1 e 100000.", Toast.LENGTH_SHORT).show()
-                        lastCode = ""
+                        candidateCode = ""; candidateHits = 0
                     } else saveRecord(code, quantity, format)
                 }.show()
         } else saveRecord(code, 1, format)

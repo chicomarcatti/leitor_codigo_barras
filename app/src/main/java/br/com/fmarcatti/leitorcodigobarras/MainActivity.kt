@@ -24,16 +24,25 @@ import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import java.io.File
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.nio.charset.Charset
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import org.json.JSONArray
 import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
-    data class ScanRecord(val code: String, val location: String, val quantity: Int, val format: String)
+    data class CatalogProduct(val internalCode: String, val reference: String, val barcode: String, val description: String, val unit: String)
+    data class ScanRecord(val code: String, val location: String, val quantity: Int, val format: String,
+                          val internalCode: String = "", val description: String = "", val unit: String = "")
 
-    private val prefs by lazy { getSharedPreferences("scanner_data", MODE_PRIVATE) }
+    private var companyKey = ""
+    private var companyName = ""
+    private val prefs by lazy { getSharedPreferences("scanner_data_$companyKey", MODE_PRIVATE) }
     private val records = mutableListOf<ScanRecord>()
+    private val products = mutableListOf<CatalogProduct>()
+    private lateinit var titleBar: TextView
     private lateinit var previewView: PreviewView
     private lateinit var countText: TextView
     private lateinit var lastText: TextView
@@ -64,11 +73,120 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         cameraExecutor = Executors.newSingleThreadExecutor()
         toneGenerator = try { ToneGenerator(AudioManager.STREAM_MUSIC, 85) } catch (_: Exception) { null }
-        loadRecords()
         buildUi()
-        askLocation {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
-            else permissionLauncher.launch(Manifest.permission.CAMERA)
+        chooseCompany()
+    }
+
+    private fun chooseCompany() {
+        val labels = arrayOf("Dubraz Elétrica", "Agro Cubatão")
+        AlertDialog.Builder(this).setTitle("Selecione a empresa")
+            .setItems(labels) { _, which ->
+                companyKey = if (which == 0) "dubraz" else "agro"
+                companyName = labels[which]
+                loadRecords()
+                offerLegacyMigration()
+                loadCatalog(if (which == 0) "EAN - DUBRAZ.csv" else "EAN - AGRO.csv")
+                titleBar.text = "LEITOR DE CÓDIGOS — $companyName"
+                refreshList()
+                askLocation {
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
+                    else permissionLauncher.launch(Manifest.permission.CAMERA)
+                }
+            }.setCancelable(false).show()
+    }
+
+    private fun offerLegacyMigration() {
+        if (records.isNotEmpty()) return
+        val legacy = getSharedPreferences("scanner_data", MODE_PRIVATE)
+        val json = legacy.getString("records_json", null)
+        val oldCodes = legacy.getString("codes", "") ?: ""
+        if (json.isNullOrBlank() && oldCodes.isBlank()) return
+        AlertDialog.Builder(this).setTitle("Inventário anterior encontrado")
+            .setMessage("A lista anterior não identifica a empresa. Deseja importar os registros para $companyName? Escolha esta opção apenas se essa era a empresa da lista antiga.")
+            .setNegativeButton("Manter separado", null)
+            .setPositiveButton("Importar para $companyName") { _, _ ->
+                try {
+                    if (!json.isNullOrBlank()) {
+                        val array = JSONArray(json)
+                        for (i in 0 until array.length()) {
+                            val o = array.getJSONObject(i)
+                            records.add(ScanRecord(o.optString("code"), o.optString("location", "Não informado"), o.optInt("quantity", 1), o.optString("format", "Desconhecido")))
+                        }
+                    } else records.addAll(oldCodes.split("\n").filter { it.isNotEmpty() }.map { ScanRecord(it, "Não informado", 1, "Versão anterior") })
+                    saveRecords()
+                    legacy.edit().remove("records_json").remove("codes").apply()
+                    refreshList()
+                    Toast.makeText(this, "Inventário anterior importado para $companyName.", Toast.LENGTH_LONG).show()
+                } catch (_: Exception) {
+                    showNotice("Falha na importação", "Não foi possível ler a lista anterior. Ela foi mantida sem alterações.")
+                }
+            }.show()
+    }
+
+    private fun loadCatalog(assetName: String) {
+        products.clear()
+        try {
+            assets.open(assetName).use { input ->
+                BufferedReader(InputStreamReader(input, Charset.forName("windows-1252"))).use { reader ->
+                    val first = reader.readLine()?.removePrefix("\uFEFF") ?: return
+                    val delimiter = if (first.count { it == ';' } >= first.count { it == ',' }) ';' else ','
+                    val header = parseCsvRow(first, delimiter).map { normalizeHeader(it) }
+                    fun column(vararg names: String): Int = names.asSequence().map { normalizeHeader(it) }
+                        .map { header.indexOf(it) }.firstOrNull { it >= 0 } ?: -1
+                    val codeIx = column("Código", "Codigo", "Código interno")
+                    val refIx = column("Cód. Referência", "Cod Referencia", "Referência")
+                    val eanIx = column("Código Barras", "Codigo Barras", "EAN", "GTIN")
+                    val descIx = column("Descrição", "Descricao", "Produto")
+                    val unitIx = column("Unidade", "Un")
+                    if (codeIx < 0 || descIx < 0) throw IllegalArgumentException("Cabeçalhos obrigatórios Código e Descrição não encontrados.")
+                    reader.forEachLine { line ->
+                        val row = parseCsvRow(line, delimiter)
+                        fun value(index: Int) = if (index >= 0 && index < row.size) row[index].trim() else ""
+                        val product = CatalogProduct(value(codeIx), value(refIx), value(eanIx), value(descIx), value(unitIx))
+                        if (product.internalCode.isNotEmpty() || product.description.isNotEmpty()) products.add(product)
+                    }
+                }
+            }
+            Toast.makeText(this, "Catálogo $companyName carregado: ${products.size} produtos.", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            showNotice("Falha ao carregar catálogo", "Não foi possível abrir $assetName. ${e.localizedMessage ?: "Verifique o arquivo."}")
+        }
+    }
+
+    private fun normalizeHeader(value: String) = java.text.Normalizer.normalize(value, java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{Mn}+"), "").lowercase().replace(Regex("[^a-z0-9]"), "")
+
+    private fun parseCsvRow(line: String, delimiter: Char): List<String> {
+        val result = mutableListOf<String>(); val cell = StringBuilder(); var quoted = false; var i = 0
+        while (i < line.length) {
+            val ch = line[i]
+            if (quoted && ch == '"' && i + 1 < line.length && line[i + 1] == '"') { cell.append('"'); i++ }
+            else if (ch == '"') quoted = !quoted
+            else if (ch == delimiter && !quoted) { result.add(cell.toString()); cell.setLength(0) }
+            else cell.append(ch)
+            i++
+        }
+        result.add(cell.toString()); return result
+    }
+
+    private fun productsFor(code: String): List<CatalogProduct> = products.filter {
+        it.barcode == code || it.internalCode.equals(code, true) || (it.reference.isNotEmpty() && it.reference.equals(code, true))
+    }
+
+    private fun resolveProduct(code: String, onResolved: (CatalogProduct?) -> Unit) {
+        val found = productsFor(code)
+        when (found.size) {
+            0 -> AlertDialog.Builder(this).setTitle("Produto não localizado")
+                .setMessage("O código $code não aparece no catálogo de $companyName. Deseja registrar mesmo assim?")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Registrar sem catálogo") { _, _ -> onResolved(null) }.show()
+            1 -> onResolved(found.first())
+            else -> {
+                val labels = found.map { "${it.description}\nCódigo: ${it.internalCode}  •  EAN: ${it.barcode}\nReferência: ${it.reference.ifBlank { "—" }}  •  Un.: ${it.unit.ifBlank { "—" }}" }.toTypedArray()
+                AlertDialog.Builder(this).setTitle("Código duplicado — selecione o produto")
+                    .setItems(labels) { _, index -> onResolved(found[index]) }
+                    .setNegativeButton("Cancelar", null).show()
+            }
         }
     }
 
@@ -78,12 +196,12 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.rgb(245, 247, 250))
             setPadding(dp(12), dp(8), dp(12), dp(8))
         }
-        val title = TextView(this).apply {
+        titleBar = TextView(this).apply {
             text = "LEITOR DE CÓDIGOS"
             textSize = 22f; setTextColor(Color.rgb(13, 71, 161)); gravity = Gravity.CENTER
             setPadding(0, dp(4), 0, dp(6)); setTypeface(null, android.graphics.Typeface.BOLD)
         }
-        root.addView(title, matchWrap())
+        root.addView(titleBar, matchWrap())
 
         locationText = TextView(this).apply {
             textSize = 14f; setTextColor(Color.DKGRAY); gravity = Gravity.CENTER
@@ -255,11 +373,14 @@ class MainActivity : AppCompatActivity() {
         }
         // O bip confirma a captura pela câmera, antes de pedir a quantidade.
         playScanBeep()
-        if (records.any { it.code.equals(code, ignoreCase = true) }) {
-            showNotice("Código já registrado", "O código $code já existe na listagem.\n\nA leitura não foi adicionada novamente.")
-            return
+        resolveProduct(code) { product ->
+            val identity = product?.internalCode?.ifBlank { code } ?: code
+            if (records.any { (it.internalCode.ifBlank { it.code }).equals(identity, true) }) {
+                showNotice("Produto já registrado", "${product?.description ?: "O código $code"} já existe na listagem.\n\nA leitura não foi adicionada novamente.")
+                return@resolveProduct
+            }
+            addRecordWithQuantity(code, formatName(format), product)
         }
-        addRecordWithQuantity(code, formatName(format))
     }
 
     private fun showNotice(title: String, message: String) {
@@ -299,7 +420,7 @@ class MainActivity : AppCompatActivity() {
         return (10 - sum % 10) % 10 == check
     }
 
-    private fun addRecordWithQuantity(code: String, format: String) {
+    private fun addRecordWithQuantity(code: String, format: String, product: CatalogProduct? = null) {
         if (countMode) {
             val quantityInput = EditText(this).apply {
                 hint = "Quantidade"
@@ -319,18 +440,18 @@ class MainActivity : AppCompatActivity() {
                     if (quantity == null || quantity < 1 || quantity > 100000) {
                         showNotice("Quantidade inválida", "Informe uma quantidade entre 1 e 100000.\n\nO produto não foi gravado.")
                         candidateCode = ""; candidateHits = 0
-                    } else saveRecord(code, quantity, format)
+                    } else saveRecord(code, quantity, format, product)
                 }.create()
             dialog.setOnShowListener {
                 quantityInput.requestFocus()
                 dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
             }
             dialog.show()
-        } else saveRecord(code, 1, format)
+        } else saveRecord(code, 1, format, product)
     }
 
-    private fun saveRecord(code: String, quantity: Int, format: String) {
-        records.add(ScanRecord(code, currentLocation, quantity, format))
+    private fun saveRecord(code: String, quantity: Int, format: String, product: CatalogProduct? = null) {
+        records.add(ScanRecord(code, currentLocation, quantity, format, product?.internalCode.orEmpty(), product?.description.orEmpty(), product?.unit.orEmpty()))
         saveRecords(); refreshList()
         lastText.text = "Último código: $code | Qtd.: $quantity"
     }
@@ -341,11 +462,14 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("Cancelar", null)
             .setPositiveButton("Adicionar") { _, _ ->
                 val value = input.text.toString().trim()
-                if (!isValidBarcode(value)) {
-                    showNotice("Código inválido — não gravado", "O código informado não passou na validação.\n\nCódigo: ${value.ifEmpty { "(vazio)" }}\n\nConfira os dígitos e tente novamente.")
-                } else if (records.any { it.code.equals(value, ignoreCase = true) }) {
-                    showNotice("Código já registrado", "O código $value já existe na listagem.\n\nA leitura não foi adicionada novamente.")
-                } else addRecordWithQuantity(value, "Manual")
+                if (value.isBlank() || (!isValidBarcode(value) && productsFor(value).isEmpty())) {
+                    showNotice("Código inválido — não gravado", "O código informado não passou na validação nem existe no catálogo.\n\nCódigo: ${value.ifEmpty { "(vazio)" }}\n\nConfira os dígitos e tente novamente.")
+                } else resolveProduct(value) { product ->
+                    val identity = product?.internalCode?.ifBlank { value } ?: value
+                    if (records.any { (it.internalCode.ifBlank { it.code }).equals(identity, true) })
+                        showNotice("Produto já registrado", "${product?.description ?: "O código $value"} já existe na listagem.")
+                    else addRecordWithQuantity(value, "Manual", product)
+                }
             }.show()
     }
 
@@ -356,8 +480,8 @@ class MainActivity : AppCompatActivity() {
             when (which) {
                 0 -> shareFile("txt", "codigos.txt", records.joinToString("\n") { it.code })
                 1 -> {
-                    val rows = records.mapIndexed { index, r -> "${index + 1};${csv(r.location)};${csv(r.code)};${r.quantity};${csv(r.format)}" }
-                    shareFile("csv", "codigos_sequenciais.csv", "Nº;Local;Código;Quantidade;Formato\n" + rows.joinToString("\n"))
+                    val rows = records.mapIndexed { index, r -> "${index + 1};${csv(r.internalCode)};${csv(r.code)};${csv(r.description)};${csv(r.unit)};${csv(r.location)};${r.quantity};${csv(r.format)}" }
+                    shareFile("csv", "inventario_${companyKey}.csv", "Empresa;Nº;Código interno;Código de barras;Descrição;Unidade;Local;Quantidade;Formato\n" + rows.joinToString("\n") { "$companyName;$it" })
                 }
             }
         }.show()
@@ -368,7 +492,7 @@ class MainActivity : AppCompatActivity() {
     private fun shareFile(extension: String, fileName: String, content: String) {
         try {
             val dir = File(cacheDir, "exports"); if (!dir.exists()) dir.mkdirs()
-            val file = File(dir, fileName); file.writeText(content, Charsets.UTF_8)
+            val file = File(dir, fileName); file.writeText(if (extension == "csv") "\uFEFF$content" else content, Charsets.UTF_8)
             val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
             val intent = Intent(Intent.ACTION_SEND).apply {
                 type = if (extension == "txt") "text/plain" else "text/csv"
@@ -396,7 +520,7 @@ class MainActivity : AppCompatActivity() {
                 val array = JSONArray(jsonText)
                 for (i in 0 until array.length()) {
                     val o = array.getJSONObject(i)
-                    records.add(ScanRecord(o.optString("code"), o.optString("location", "Não informado"), o.optInt("quantity", 1), o.optString("format", "Desconhecido")))
+                    records.add(ScanRecord(o.optString("code"), o.optString("location", "Não informado"), o.optInt("quantity", 1), o.optString("format", "Desconhecido"), o.optString("internalCode"), o.optString("description"), o.optString("unit")))
                 }
                 return
             } catch (_: Exception) { records.clear() }
@@ -409,16 +533,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveRecords() {
         val array = JSONArray()
-        records.forEach { r -> array.put(JSONObject().put("code", r.code).put("location", r.location).put("quantity", r.quantity).put("format", r.format)) }
+        records.forEach { r -> array.put(JSONObject().put("code", r.code).put("location", r.location).put("quantity", r.quantity).put("format", r.format).put("internalCode", r.internalCode).put("description", r.description).put("unit", r.unit)) }
         prefs.edit().putString("records_json", array.toString()).apply()
     }
 
     private fun refreshList() {
         if (!::adapter.isInitialized) return
         adapter.clear()
-        adapter.addAll(records.mapIndexed { index, r -> "${index + 1}. ${r.code} | Qtd.: ${r.quantity} | ${r.location}" })
+        adapter.addAll(records.mapIndexed { index, r -> "${index + 1}. ${r.description.ifBlank { "Produto sem descrição" }} | Interno: ${r.internalCode.ifBlank { "—" }} | EAN: ${r.code} | Qtd.: ${r.quantity} | ${r.location}" })
         adapter.notifyDataSetChanged()
-        countText.text = "Registros: ${records.size} | Unidades: ${records.sumOf { it.quantity }}"
+        countText.text = "${companyName.ifBlank { "Inventário" }} — Registros: ${records.size} | Unidades: ${records.sumOf { it.quantity }}"
     }
 
     private fun formatName(format: Int): String = when (format) {

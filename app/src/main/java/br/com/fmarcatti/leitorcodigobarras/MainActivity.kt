@@ -250,10 +250,28 @@ class MainActivity : AppCompatActivity() {
     private fun addScannedCode(code: String, format: Int) {
         if (!isValidBarcode(code, format)) {
             lastText.text = "Leitura rejeitada: código inválido ($code)"
-            Toast.makeText(this, "Código inválido ou leitura incompleta. Tente novamente.", Toast.LENGTH_SHORT).show()
+            showNotice("Leitura não gravada", "O código lido é inválido ou está incompleto.\n\nCódigo: $code\n\nNenhum registro foi adicionado. Confira o produto e tente novamente.")
+            return
+        }
+        // O bip confirma a captura pela câmera, antes de pedir a quantidade.
+        playScanBeep()
+        if (records.any { it.code.equals(code, ignoreCase = true) }) {
+            showNotice("Código já registrado", "O código $code já existe na listagem.\n\nA leitura não foi adicionada novamente.")
             return
         }
         addRecordWithQuantity(code, formatName(format))
+    }
+
+    private fun showNotice(title: String, message: String) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton("Fechar", null)
+            .show()
+    }
+
+    private fun playScanBeep() {
+        try { toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 120) } catch (_: Exception) { }
     }
 
     private fun isValidBarcode(value: String, format: Int = Barcode.FORMAT_UNKNOWN): Boolean {
@@ -284,20 +302,30 @@ class MainActivity : AppCompatActivity() {
     private fun addRecordWithQuantity(code: String, format: String) {
         if (countMode) {
             val quantityInput = EditText(this).apply {
-                hint = "Quantidade"; inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                hint = "Quantidade"
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                textSize = 28f
+                gravity = Gravity.CENTER
                 setText("1")
+                selectAll()
+                isSingleLine = true
             }
-            AlertDialog.Builder(this).setTitle("Quantidade do item")
+            val dialog = AlertDialog.Builder(this).setTitle("Quantidade do item")
                 .setMessage("Código: $code")
                 .setView(quantityInput)
                 .setNegativeButton("Cancelar") { _, _ -> candidateCode = ""; candidateHits = 0 }
                 .setPositiveButton("Registrar") { _, _ ->
                     val quantity = quantityInput.text.toString().toIntOrNull()
                     if (quantity == null || quantity < 1 || quantity > 100000) {
-                        Toast.makeText(this, "Informe uma quantidade entre 1 e 100000.", Toast.LENGTH_SHORT).show()
+                        showNotice("Quantidade inválida", "Informe uma quantidade entre 1 e 100000.\n\nO produto não foi gravado.")
                         candidateCode = ""; candidateHits = 0
                     } else saveRecord(code, quantity, format)
-                }.show()
+                }.create()
+            dialog.setOnShowListener {
+                quantityInput.requestFocus()
+                dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+            }
+            dialog.show()
         } else saveRecord(code, 1, format)
     }
 
@@ -305,7 +333,6 @@ class MainActivity : AppCompatActivity() {
         records.add(ScanRecord(code, currentLocation, quantity, format))
         saveRecords(); refreshList()
         lastText.text = "Último código: $code | Qtd.: $quantity"
-        try { toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 120) } catch (_: Exception) { }
     }
 
     private fun showManualEntry() {
@@ -314,8 +341,11 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("Cancelar", null)
             .setPositiveButton("Adicionar") { _, _ ->
                 val value = input.text.toString().trim()
-                if (isValidBarcode(value)) addRecordWithQuantity(value, "Manual")
-                else Toast.makeText(this, "Código inválido. Confira os dígitos e tente novamente.", Toast.LENGTH_SHORT).show()
+                if (!isValidBarcode(value)) {
+                    showNotice("Código inválido — não gravado", "O código informado não passou na validação.\n\nCódigo: ${value.ifEmpty { "(vazio)" }}\n\nConfira os dígitos e tente novamente.")
+                } else if (records.any { it.code.equals(value, ignoreCase = true) }) {
+                    showNotice("Código já registrado", "O código $value já existe na listagem.\n\nA leitura não foi adicionada novamente.")
+                } else addRecordWithQuantity(value, "Manual")
             }.show()
     }
 

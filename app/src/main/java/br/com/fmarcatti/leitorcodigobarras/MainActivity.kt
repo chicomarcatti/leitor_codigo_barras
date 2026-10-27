@@ -7,6 +7,9 @@ import android.graphics.Color
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.view.WindowManager
 import android.view.Gravity
 import android.view.MotionEvent
 import android.widget.*
@@ -30,12 +33,14 @@ import java.io.File
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.nio.charset.Charset
+import java.io.InputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import android.hardware.camera2.CaptureRequest
 import org.json.JSONArray
 import org.json.JSONObject
+import jxl.Workbook
 
 class MainActivity : AppCompatActivity() {
     data class CatalogProduct(val internalCode: String, val reference: String, val barcode: String, val description: String, val unit: String)
@@ -66,19 +71,33 @@ class MainActivity : AppCompatActivity() {
     private var scanning = false
     private var torchOn = false
     private var countMode = false
+    private var useCatalog = true
+    private var keepScreenOn = false
     private var currentLocation = ""
     private var toneGenerator: ToneGenerator? = null
+    private val appSettingsPrefs by lazy { getSharedPreferences("scanner_settings", MODE_PRIVATE) }
+    private lateinit var screenToggleButton: Button
+    private lateinit var catalogToggleButton: Button
+    private lateinit var importCatalogButton: Button
+    private lateinit var catalogExecutor: ExecutorService
 
     private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startCamera()
         else Toast.makeText(this, "Permissão da câmera necessária para ler códigos.", Toast.LENGTH_LONG).show()
     }
 
+    private val catalogPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) importCatalog(uri)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         cameraExecutor = Executors.newSingleThreadExecutor()
+        catalogExecutor = Executors.newSingleThreadExecutor()
+        keepScreenOn = appSettingsPrefs.getBoolean("keep_screen_on", false)
         toneGenerator = try { ToneGenerator(AudioManager.STREAM_MUSIC, 85) } catch (_: Exception) { null }
         buildUi()
+        applyKeepScreenOn()
         chooseCompany()
     }
 
@@ -88,6 +107,8 @@ class MainActivity : AppCompatActivity() {
             .setItems(labels) { _, which ->
                 companyKey = if (which == 0) "dubraz" else "agro"
                 companyName = labels[which]
+                useCatalog = prefs.getBoolean("use_catalog", true)
+                updateCatalogToggle()
                 loadRecords()
                 offerLegacyMigration()
                 loadCatalog(if (which == 0) "EAN - DUBRAZ.csv" else "EAN - AGRO.csv")
@@ -130,10 +151,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadCatalog(assetName: String) {
         products.clear()
+        val imported = readImportedCatalog()
+        if (!imported.isNullOrEmpty()) {
+            products.addAll(imported)
+            Toast.makeText(this, "Base atualizada carregada: ${products.size} produtos.", Toast.LENGTH_LONG).show()
+            return
+        }
         try {
             assets.open(assetName).use { input ->
                 BufferedReader(InputStreamReader(input, Charset.forName("windows-1252"))).use { reader ->
-                    val first = reader.readLine()?.removePrefix("\uFEFF") ?: return
+                    val first = reader.readLine()?.removePrefix("﻿") ?: return
                     val delimiter = if (first.count { it == ';' } >= first.count { it == ',' }) ';' else ','
                     val header = parseCsvRow(first, delimiter).map { normalizeHeader(it) }
                     fun column(vararg names: String): Int = names.asSequence().map { normalizeHeader(it) }
@@ -157,7 +184,140 @@ class MainActivity : AppCompatActivity() {
             showNotice("Falha ao carregar catálogo", "Não foi possível abrir $assetName. ${e.localizedMessage ?: "Verifique o arquivo."}")
         }
     }
+    private fun importedCatalogFile() = File(filesDir, "catalog_" + companyKey + ".json")
 
+    private fun readImportedCatalog(): List<CatalogProduct>? {
+        val file = importedCatalogFile()
+        if (!file.exists()) return null
+        return try {
+            val json = JSONArray(android.util.AtomicFile(file).openRead().bufferedReader(Charsets.UTF_8).use { it.readText() })
+            buildList {
+                for (i in 0 until json.length()) {
+                    val item = json.getJSONObject(i)
+                    add(CatalogProduct(item.optString("internalCode"), item.optString("reference"), item.optString("barcode"), item.optString("description"), item.optString("unit")))
+                }
+            }.takeIf { it.isNotEmpty() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun persistImportedCatalog(catalog: List<CatalogProduct>) {
+        val json = JSONArray()
+        catalog.forEach { item ->
+            json.put(JSONObject()
+                .put("internalCode", item.internalCode)
+                .put("reference", item.reference)
+                .put("barcode", item.barcode)
+                .put("description", item.description)
+                .put("unit", item.unit))
+        }
+        val atomic = android.util.AtomicFile(importedCatalogFile())
+        val output = atomic.startWrite()
+        try {
+            output.write(json.toString().toByteArray(Charsets.UTF_8))
+            atomic.finishWrite(output)
+        } catch (e: Exception) {
+            atomic.failWrite(output)
+            throw e
+        }
+    }
+
+    private fun openCatalogPicker() {
+        if (companyKey.isBlank()) {
+            Toast.makeText(this, "Selecione uma empresa primeiro.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        catalogPicker.launch(arrayOf("application/vnd.ms-excel", "application/octet-stream"))
+    }
+
+    private fun importCatalog(uri: Uri) {
+        val displayName = try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(cursor.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) else null
+            }
+        } catch (_: Exception) { null } ?: uri.lastPathSegment.orEmpty()
+        if (!displayName.endsWith(".xls", ignoreCase = true)) {
+            showNotice("Formato não aceito", "Selecione uma planilha Excel antiga com extensão .xls. Arquivos .xlsx precisam ser salvos como .xls.")
+            return
+        }
+        importCatalogButton.isEnabled = false
+        catalogExecutor.execute {
+            try {
+                val imported = contentResolver.openInputStream(uri)?.use { input ->
+                    productsFromRows(readXlsRows(input))
+                } ?: throw IllegalArgumentException("O arquivo não pôde ser aberto.")
+                runOnUiThread {
+                    importCatalogButton.isEnabled = true
+                    confirmCatalogUpdate(displayName, imported)
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    importCatalogButton.isEnabled = true
+                    showNotice("Falha ao ler planilha", e.localizedMessage ?: "Confira se o arquivo .xls está válido.")
+                }
+            }
+        }
+    }
+
+    private fun readXlsRows(input: InputStream): List<List<String>> {
+        val workbook = Workbook.getWorkbook(input)
+        try {
+            if (workbook.numberOfSheets < 1) throw IllegalArgumentException("A planilha não contém abas.")
+            val sheet = workbook.getSheet(0)
+            return (0 until sheet.rows).map { row ->
+                (0 until sheet.columns).map { column -> sheet.getCell(column, row).contents.trim() }
+            }
+        } finally {
+            workbook.close()
+        }
+    }
+
+    private fun productsFromRows(rows: List<List<String>>): List<CatalogProduct> {
+        fun column(headers: List<String>, vararg names: String): Int {
+            val normalized = headers.map { normalizeHeader(it) }
+            return names.asSequence().map { normalizeHeader(it) }
+                .map { normalized.indexOf(it) }.firstOrNull { it >= 0 } ?: -1
+        }
+        val headerIndex = rows.indexOfFirst { row ->
+            val hasDescription = column(row, "Descrição", "Descricao", "Produto") >= 0
+            val hasCode = column(row, "Código", "Codigo", "Código interno", "Código do produto") >= 0 ||
+                column(row, "Código Barras", "Codigo Barras", "EAN", "GTIN") >= 0
+            hasDescription && hasCode
+        }
+        if (headerIndex < 0) throw IllegalArgumentException("Não encontrei os cabeçalhos. A primeira planilha precisa ter Descrição e Código ou Código Barras.")
+        val header = rows[headerIndex]
+        val codeIx = column(header, "Código", "Codigo", "Código interno", "Código do produto")
+        val refIx = column(header, "Cód. Referência", "Cod Referencia", "Referência", "Referencia")
+        val eanIx = column(header, "Código Barras", "Codigo Barras", "EAN", "GTIN", "Código EAN")
+        val descIx = column(header, "Descrição", "Descricao", "Produto")
+        val unitIx = column(header, "Unidade", "Un")
+        fun value(row: List<String>, index: Int) = if (index >= 0 && index < row.size) row[index].trim() else ""
+        val result = rows.drop(headerIndex + 1).mapNotNull { row ->
+            val item = CatalogProduct(value(row, codeIx), value(row, refIx), value(row, eanIx), value(row, descIx), value(row, unitIx))
+            item.takeIf { it.internalCode.isNotEmpty() || it.barcode.isNotEmpty() }
+        }
+        if (result.isEmpty()) throw IllegalArgumentException("A planilha não contém produtos depois do cabeçalho.")
+        return result
+    }
+
+    private fun confirmCatalogUpdate(fileName: String, imported: List<CatalogProduct>) {
+        AlertDialog.Builder(this)
+            .setTitle("Atualizar base de dados")
+            .setMessage("A planilha $fileName contém ${imported.size} produtos. Deseja substituir a base de $companyName? Os registros já feitos no inventário serão mantidos.")
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Atualizar") { _, _ ->
+                try {
+                    persistImportedCatalog(imported)
+                    products.clear()
+                    products.addAll(imported)
+                    Toast.makeText(this, "Base de $companyName atualizada: ${products.size} produtos.", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    showNotice("Falha ao salvar base", e.localizedMessage ?: "A base atual não foi substituída.")
+                }
+            }
+            .show()
+    }
     private fun normalizeHeader(value: String) = java.text.Normalizer.normalize(value, java.text.Normalizer.Form.NFD)
         .replace(Regex("\\p{Mn}+"), "").lowercase().replace(Regex("[^a-z0-9]"), "")
 
@@ -179,6 +339,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun resolveProduct(code: String, onResolved: (CatalogProduct?) -> Unit) {
+        if (!useCatalog) { onResolved(null); return }
         val found = productsFor(code)
         when (found.size) {
             0 -> AlertDialog.Builder(this).setTitle("Produto não localizado")
@@ -207,6 +368,28 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, dp(4), 0, dp(6)); setTypeface(null, android.graphics.Typeface.BOLD)
         }
         root.addView(titleBar, matchWrap())
+        val creditLine = TextView(this).apply {
+            text = "Desenvolvido por Francisco Marcatti"
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(4))
+        }
+        root.addView(creditLine, matchWrap())
+
+        val utilityButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val guideButton = button("Guia de funções")
+        guideButton.setOnClickListener { showFunctionsGuide() }
+        screenToggleButton = button("Tela ligada: NÃO")
+        screenToggleButton.setOnClickListener {
+            keepScreenOn = !keepScreenOn
+            appSettingsPrefs.edit().putBoolean("keep_screen_on", keepScreenOn).apply()
+            applyKeepScreenOn()
+            Toast.makeText(this@MainActivity, if (keepScreenOn) "A tela ficará ligada enquanto o app estiver aberto." else "O descanso de tela foi reativado.", Toast.LENGTH_SHORT).show()
+        }
+        utilityButtons.addView(guideButton, weighted())
+        utilityButtons.addView(screenToggleButton, weighted())
+        root.addView(utilityButtons)
 
         locationText = TextView(this).apply {
             textSize = 14f; setTextColor(Color.DKGRAY); gravity = Gravity.CENTER
@@ -268,6 +451,20 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(modeButton, matchWrap())
 
+        val catalogControls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        catalogToggleButton = button("Usar base: ATIVADA")
+        catalogToggleButton.setOnClickListener {
+            useCatalog = !useCatalog
+            prefs.edit().putBoolean("use_catalog", useCatalog).apply()
+            updateCatalogToggle()
+            Toast.makeText(this@MainActivity, if (useCatalog) "A base será usada nas próximas leituras." else "Leituras serão registradas sem consultar a base.", Toast.LENGTH_SHORT).show()
+        }
+        importCatalogButton = button("Carregar XLS")
+        importCatalogButton.setOnClickListener { openCatalogPicker() }
+        catalogControls.addView(catalogToggleButton, weighted())
+        catalogControls.addView(importCatalogButton, weighted())
+        root.addView(catalogControls)
+
         countText = TextView(this).apply {
             textSize = 15f; setTextColor(Color.rgb(33, 33, 33)); setTypeface(null, android.graphics.Typeface.BOLD)
             setPadding(0, dp(6), 0, dp(2))
@@ -301,6 +498,55 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
         updateLocationText()
         refreshList()
+    }
+
+    private fun applyKeepScreenOn() {
+        if (keepScreenOn) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (::screenToggleButton.isInitialized) {
+            screenToggleButton.text = if (keepScreenOn) "Tela ligada: SIM" else "Tela ligada: NÃO"
+        }
+    }
+
+    private fun updateCatalogToggle() {
+        if (::catalogToggleButton.isInitialized) {
+            catalogToggleButton.text = if (useCatalog) "Usar base: ATIVADA" else "Usar base: DESATIVADA"
+        }
+    }
+
+    private fun openCatalogPicker() {
+        if (companyKey.isBlank()) {
+            Toast.makeText(this, "Selecione uma empresa primeiro.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        catalogPicker.launch(arrayOf("application/vnd.ms-excel", "application/octet-stream"))
+    }
+
+    private fun showFunctionsGuide() {
+        val guide = """
+            LEITURA E FOCO
+            Aponte para o código. Toque na prévia para focar; use os botões de zoom se precisar enquadrar sem aproximar o celular. A lanterna ajuda em locais escuros.
+
+            MODO CONTAGEM
+            Ative para informar a quantidade de cada produto. Desativado, cada leitura vale 1 unidade.
+
+            USAR BASE DE DADOS
+            Ative para localizar produtos pelo código de barras, código interno ou referência. Desative para registrar códigos sem consultar o catálogo.
+
+            CARREGAR XLS
+            Escolha um arquivo Excel .xls. A primeira planilha precisa ter uma coluna de descrição e pelo menos uma coluna de código ou código de barras. A atualização substitui o catálogo da empresa selecionada; os registros do inventário permanecem guardados.
+
+            TELA LIGADA
+            Ative para impedir que a tela apague enquanto o aplicativo estiver aberto. Desative para voltar ao tempo de descanso configurado no Android.
+
+            LISTA E EXPORTAÇÃO
+            Toque e segure um registro para removê-lo. Use Exportar para compartilhar TXT ou CSV.
+        """.trimIndent()
+        AlertDialog.Builder(this)
+            .setTitle("Guia de funções")
+            .setMessage(guide)
+            .setPositiveButton("Fechar", null)
+            .show()
     }
 
     private fun askLocation(onDone: (() -> Unit)? = null) {
@@ -508,7 +754,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveRecord(code: String, quantity: Int, format: String, product: CatalogProduct? = null) {
         records.add(ScanRecord(code, currentLocation, quantity, format, product?.internalCode.orEmpty(), product?.description.orEmpty(), product?.unit.orEmpty()))
-        saveRecords(); refreshList()
+        saveRecords(); refreshList(scrollToNewest = true)
         lastText.text = "Último código: $code | Qtd.: $quantity"
     }
 
@@ -518,7 +764,7 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("Cancelar", null)
             .setPositiveButton("Adicionar") { _, _ ->
                 val value = input.text.toString().trim()
-                if (value.isBlank() || (!isValidBarcode(value) && productsFor(value).isEmpty())) {
+                if (value.isBlank() || (!isValidBarcode(value) && (!useCatalog || productsFor(value).isEmpty()))) {
                     showNotice("Código inválido — não gravado", "O código informado não passou na validação nem existe no catálogo.\n\nCódigo: ${value.ifEmpty { "(vazio)" }}\n\nConfira os dígitos e tente novamente.")
                 } else resolveProduct(value) { product ->
                     val identity = product?.internalCode?.ifBlank { value } ?: value
@@ -593,12 +839,15 @@ class MainActivity : AppCompatActivity() {
         prefs.edit().putString("records_json", array.toString()).apply()
     }
 
-    private fun refreshList() {
+    private fun refreshList(scrollToNewest: Boolean = false) {
         if (!::adapter.isInitialized) return
         adapter.clear()
         adapter.addAll(records.mapIndexed { index, r -> "${index + 1}. ${r.description.ifBlank { "Produto sem descrição" }} | Interno: ${r.internalCode.ifBlank { "—" }} | EAN: ${r.code} | Qtd.: ${r.quantity} | ${r.location}" })
         adapter.notifyDataSetChanged()
         countText.text = "${companyName.ifBlank { "Inventário" }} — Registros: ${records.size} | Unidades: ${records.sumOf { it.quantity }}"
+        if (scrollToNewest && adapter.count > 0) {
+            listView.post { listView.smoothScrollToPosition(adapter.count - 1) }
+        }
     }
 
     private fun formatName(format: Int): String = when (format) {
@@ -616,6 +865,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         try { toneGenerator?.release() } catch (_: Exception) { }
+        if (::catalogExecutor.isInitialized) catalogExecutor.shutdown()
         if (::cameraExecutor.isInitialized) cameraExecutor.shutdown()
     }
 }

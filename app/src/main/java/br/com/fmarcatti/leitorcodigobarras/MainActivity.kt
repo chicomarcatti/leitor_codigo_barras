@@ -514,13 +514,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun openCatalogPicker() {
-        if (companyKey.isBlank()) {
-            Toast.makeText(this, "Selecione uma empresa primeiro.", Toast.LENGTH_SHORT).show()
-            return
-        }
-        catalogPicker.launch(arrayOf("application/vnd.ms-excel", "application/octet-stream"))
-    }
 
     private fun showFunctionsGuide() {
         val guide = """

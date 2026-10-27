@@ -8,15 +8,18 @@ import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
 import android.view.Gravity
+import android.view.MotionEvent
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
@@ -29,6 +32,8 @@ import java.io.InputStreamReader
 import java.nio.charset.Charset
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import android.hardware.camera2.CaptureRequest
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -212,14 +217,32 @@ class MainActivity : AppCompatActivity() {
         locationButton.setOnClickListener { askLocation() }
         root.addView(locationButton, matchWrap())
 
-        previewView = PreviewView(this).apply { implementationMode = PreviewView.ImplementationMode.COMPATIBLE }
+        previewView = PreviewView(this).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            // Tocar no centro do código força uma nova medição de foco e exposição.
+            setOnTouchListener { view, event ->
+                if (event.action == MotionEvent.ACTION_UP) {
+                    focusAt(event.x, event.y)
+                    view.performClick()
+                    true
+                } else true
+            }
+        }
         root.addView(previewView, LinearLayout.LayoutParams(-1, dp(190)))
         val scanInfo = TextView(this).apply {
-            text = "Aponte para o código de barras. QR Code desativado."
+            text = "Toque no código para focar. Se ficar borrado, afaste o celular e use o zoom. QR Code desativado."
             textSize = 13f; gravity = Gravity.CENTER; setTextColor(Color.DKGRAY)
             setPadding(0, dp(5), 0, dp(5))
         }
         root.addView(scanInfo, matchWrap())
+
+        val zoomButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val zoomOutButton = button("− Zoom")
+        zoomOutButton.setOnClickListener { adjustZoom(false) }
+        val zoomInButton = button("+ Zoom")
+        zoomInButton.setOnClickListener { adjustZoom(true) }
+        zoomButtons.addView(zoomOutButton, weighted()); zoomButtons.addView(zoomInButton, weighted())
+        root.addView(zoomButtons)
 
         val cameraButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val torchButton = button("Lanterna")
@@ -305,7 +328,13 @@ class MainActivity : AppCompatActivity() {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
             val provider = providerFuture.get()
-            val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            val previewBuilder = Preview.Builder()
+            // Solicita AF contínuo quando o dispositivo/lente oferece esse modo.
+            Camera2Interop.Extender(previewBuilder).setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            )
+            val preview = previewBuilder.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
             // Somente formatos de código de barras lineares; QR Code e códigos 2D ficam desativados.
             val options = BarcodeScannerOptions.Builder().setBarcodeFormats(
                 Barcode.FORMAT_EAN_13, Barcode.FORMAT_EAN_8, Barcode.FORMAT_UPC_A,
@@ -363,6 +392,33 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Não foi possível iniciar a câmera: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun focusAt(x: Float, y: Float) {
+        val activeCamera = camera ?: return
+        if (previewView.width == 0 || previewView.height == 0) return
+        try {
+            val point = previewView.meteringPointFactory.createPoint(x, y)
+            val action = FocusMeteringAction.Builder(
+                point,
+                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+            ).setAutoCancelDuration(3, TimeUnit.SECONDS).build()
+            activeCamera.cameraControl.startFocusAndMetering(action)
+            Toast.makeText(this, "Focando no ponto selecionado…", Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) {
+            Toast.makeText(this, "Foco por toque indisponível nesta câmera.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun adjustZoom(increase: Boolean) {
+        val activeCamera = camera ?: run {
+            Toast.makeText(this, "A câmera ainda não está pronta.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val state = activeCamera.cameraInfo.zoomState.value ?: return
+        val requested = if (increase) state.zoomRatio * 1.25f else state.zoomRatio / 1.25f
+        val ratio = requested.coerceIn(state.minZoomRatio, state.maxZoomRatio)
+        activeCamera.cameraControl.setZoomRatio(ratio)
     }
 
     private fun addScannedCode(code: String, format: Int) {

@@ -49,7 +49,7 @@ class MainActivity : AppCompatActivity() {
 
     private var companyKey = ""
     private var companyName = ""
-    private val prefs by lazy { getSharedPreferences("scanner_data_$companyKey", MODE_PRIVATE) }
+    private val prefs get() = getSharedPreferences("scanner_data_$companyKey", MODE_PRIVATE)
     private val records = mutableListOf<ScanRecord>()
     private val products = mutableListOf<CatalogProduct>()
     private lateinit var titleBar: TextView
@@ -77,9 +77,11 @@ class MainActivity : AppCompatActivity() {
     private var toneGenerator: ToneGenerator? = null
     private val appSettingsPrefs by lazy { getSharedPreferences("scanner_settings", MODE_PRIVATE) }
     private lateinit var screenToggleButton: Button
+    private lateinit var countModeButton: Button
     private lateinit var catalogToggleButton: Button
     private lateinit var importCatalogButton: Button
     private lateinit var catalogExecutor: ExecutorService
+    private var functionsDialog: AlertDialog? = null
 
     private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startCamera()
@@ -107,8 +109,12 @@ class MainActivity : AppCompatActivity() {
             .setItems(labels) { _, which ->
                 companyKey = if (which == 0) "dubraz" else "agro"
                 companyName = labels[which]
+                records.clear()
+                products.clear()
                 useCatalog = prefs.getBoolean("use_catalog", true)
+                countMode = prefs.getBoolean("count_mode", false)
                 updateCatalogToggle()
+                updateCountModeButton()
                 loadRecords()
                 offerLegacyMigration()
                 loadCatalog(if (which == 0) "EAN - DUBRAZ.csv" else "EAN - AGRO.csv")
@@ -377,28 +383,16 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(creditLine, matchWrap())
 
-        val utilityButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val guideButton = button("Guia de funções")
-        guideButton.setOnClickListener { showFunctionsGuide() }
-        screenToggleButton = button("Tela ligada: NÃO")
-        screenToggleButton.setOnClickListener {
-            keepScreenOn = !keepScreenOn
-            appSettingsPrefs.edit().putBoolean("keep_screen_on", keepScreenOn).apply()
-            applyKeepScreenOn()
-            Toast.makeText(this@MainActivity, if (keepScreenOn) "A tela ficará ligada enquanto o app estiver aberto." else "O descanso de tela foi reativado.", Toast.LENGTH_SHORT).show()
-        }
-        utilityButtons.addView(guideButton, weighted())
-        utilityButtons.addView(screenToggleButton, weighted())
-        root.addView(utilityButtons)
+        val functionsButton = button("Funções")
+        functionsButton.setOnClickListener { showFunctionsDialog() }
+        root.addView(functionsButton, matchWrap())
 
         locationText = TextView(this).apply {
             textSize = 14f; setTextColor(Color.DKGRAY); gravity = Gravity.CENTER
             setPadding(0, dp(2), 0, dp(5))
+            setOnClickListener { askLocation() }
         }
         root.addView(locationText, matchWrap())
-        val locationButton = button("Definir corredor / local / prateleira")
-        locationButton.setOnClickListener { askLocation() }
-        root.addView(locationButton, matchWrap())
 
         previewView = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -442,28 +436,6 @@ class MainActivity : AppCompatActivity() {
         manualButton.setOnClickListener { showManualEntry() }
         cameraButtons.addView(torchButton, weighted()); cameraButtons.addView(manualButton, weighted())
         root.addView(cameraButtons)
-
-        val modeButton = button("Modo Contagem: DESATIVADO")
-        modeButton.setOnClickListener {
-            countMode = !countMode
-            modeButton.text = if (countMode) "Modo Contagem: ATIVADO" else "Modo Contagem: DESATIVADO"
-            Toast.makeText(this, if (countMode) "Será solicitada a quantidade em cada leitura." else "Cada leitura será registrada como 1 unidade.", Toast.LENGTH_SHORT).show()
-        }
-        root.addView(modeButton, matchWrap())
-
-        val catalogControls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        catalogToggleButton = button("Usar base: ATIVADA")
-        catalogToggleButton.setOnClickListener {
-            useCatalog = !useCatalog
-            prefs.edit().putBoolean("use_catalog", useCatalog).apply()
-            updateCatalogToggle()
-            Toast.makeText(this@MainActivity, if (useCatalog) "A base será usada nas próximas leituras." else "Leituras serão registradas sem consultar a base.", Toast.LENGTH_SHORT).show()
-        }
-        importCatalogButton = button("Carregar XLS")
-        importCatalogButton.setOnClickListener { openCatalogPicker() }
-        catalogControls.addView(catalogToggleButton, weighted())
-        catalogControls.addView(importCatalogButton, weighted())
-        root.addView(catalogControls)
 
         countText = TextView(this).apply {
             textSize = 15f; setTextColor(Color.rgb(33, 33, 33)); setTypeface(null, android.graphics.Typeface.BOLD)
@@ -514,32 +486,79 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateCountModeButton() {
+        if (::countModeButton.isInitialized) {
+            countModeButton.text = if (countMode) "Modo contagem: ATIVADO" else "Modo contagem: DESATIVADO"
+        }
+    }
 
-    private fun showFunctionsGuide() {
-        val guide = """
-            LEITURA E FOCO
-            Aponte para o código. Toque na prévia para focar; use os botões de zoom se precisar enquadrar sem aproximar o celular. A lanterna ajuda em locais escuros.
 
-            MODO CONTAGEM
-            Ative para informar a quantidade de cada produto. Desativado, cada leitura vale 1 unidade.
+    private fun showFunctionsDialog() {
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(4))
+        }
+        fun addOption(option: Button) {
+            panel.addView(option, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+        }
 
-            USAR BASE DE DADOS
-            Ative para localizar produtos pelo código de barras, código interno ou referência. Desative para registrar códigos sem consultar o catálogo.
+        countModeButton = button(if (countMode) "Modo contagem: ATIVADO" else "Modo contagem: DESATIVADO")
+        countModeButton.setOnClickListener {
+            countMode = !countMode
+            prefs.edit().putBoolean("count_mode", countMode).apply()
+            updateCountModeButton()
+            Toast.makeText(this, if (countMode) "Será solicitada a quantidade em cada leitura." else "Cada leitura será registrada como 1 unidade.", Toast.LENGTH_SHORT).show()
+        }
+        addOption(countModeButton)
 
-            CARREGAR XLS
-            Escolha um arquivo Excel .xls. A primeira planilha precisa ter uma coluna de descrição e pelo menos uma coluna de código ou código de barras. A atualização substitui o catálogo da empresa selecionada; os registros do inventário permanecem guardados.
+        catalogToggleButton = button(if (useCatalog) "Usar base: ATIVADA" else "Usar base: DESATIVADA")
+        catalogToggleButton.setOnClickListener {
+            useCatalog = !useCatalog
+            prefs.edit().putBoolean("use_catalog", useCatalog).apply()
+            updateCatalogToggle()
+            refreshList()
+            Toast.makeText(this, if (useCatalog) "A base será usada nas próximas leituras." else "Leituras serão registradas sem consultar a base.", Toast.LENGTH_SHORT).show()
+        }
+        addOption(catalogToggleButton)
 
-            TELA LIGADA
-            Ative para impedir que a tela apague enquanto o aplicativo estiver aberto. Desative para voltar ao tempo de descanso configurado no Android.
+        screenToggleButton = button(if (keepScreenOn) "Tela ligada: SIM" else "Tela ligada: NÃO")
+        screenToggleButton.setOnClickListener {
+            keepScreenOn = !keepScreenOn
+            appSettingsPrefs.edit().putBoolean("keep_screen_on", keepScreenOn).apply()
+            applyKeepScreenOn()
+            screenToggleButton.text = if (keepScreenOn) "Tela ligada: SIM" else "Tela ligada: NÃO"
+            Toast.makeText(this, if (keepScreenOn) "A tela ficará ligada enquanto o app estiver aberto." else "O descanso de tela foi reativado.", Toast.LENGTH_SHORT).show()
+        }
+        addOption(screenToggleButton)
 
-            LISTA E EXPORTAÇÃO
-            Toque e segure um registro para removê-lo. Use Exportar para compartilhar TXT ou CSV.
-        """.trimIndent()
-        AlertDialog.Builder(this)
-            .setTitle("Guia de funções")
-            .setMessage(guide)
+        importCatalogButton = button("Carregar XLS")
+        importCatalogButton.setOnClickListener {
+            functionsDialog?.dismiss()
+            openCatalogPicker()
+        }
+        addOption(importCatalogButton)
+
+        val storeButton = button("Alterar loja: $companyName")
+        storeButton.setOnClickListener {
+            functionsDialog?.dismiss()
+            chooseCompany()
+        }
+        addOption(storeButton)
+
+        val locationButton = button("Definir local da leitura")
+        locationButton.setOnClickListener {
+            functionsDialog?.dismiss()
+            askLocation()
+        }
+        addOption(locationButton)
+
+        val scroll = ScrollView(this).apply { addView(panel) }
+        functionsDialog = AlertDialog.Builder(this)
+            .setTitle("Funções")
+            .setView(scroll)
             .setPositiveButton("Fechar", null)
-            .show()
+            .create()
+        functionsDialog?.show()
     }
 
     private fun askLocation(onDone: (() -> Unit)? = null) {
@@ -560,7 +579,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateLocationText() {
-        if (::locationText.isInitialized) locationText.text = "Local: $currentLocation"
+        if (::locationText.isInitialized) locationText.text = "Local: $currentLocation · toque para editar"
     }
 
     private fun startCamera() {
@@ -748,7 +767,7 @@ class MainActivity : AppCompatActivity() {
     private fun saveRecord(code: String, quantity: Int, format: String, product: CatalogProduct? = null) {
         records.add(ScanRecord(code, currentLocation, quantity, format, product?.internalCode.orEmpty(), product?.description.orEmpty(), product?.unit.orEmpty()))
         saveRecords(); refreshList(scrollToNewest = true)
-        lastText.text = "Último código: $code | Qtd.: $quantity"
+
     }
 
     private fun showManualEntry() {
@@ -832,11 +851,30 @@ class MainActivity : AppCompatActivity() {
         prefs.edit().putString("records_json", array.toString()).apply()
     }
 
+    private fun updateLastText() {
+        if (!::lastText.isInitialized) return
+        val last = records.lastOrNull()
+        if (last == null) {
+            lastText.text = "Último código: —"
+        } else if (!useCatalog || (last.internalCode.isBlank() && last.description.isBlank())) {
+            lastText.text = "Último: ${records.size}. ${last.code}"
+        } else {
+            lastText.text = "Último código: ${last.code} | Qtd.: ${last.quantity}"
+        }
+    }
+
     private fun refreshList(scrollToNewest: Boolean = false) {
         if (!::adapter.isInitialized) return
         adapter.clear()
-        adapter.addAll(records.mapIndexed { index, r -> "${index + 1}. ${r.description.ifBlank { "Produto sem descrição" }} | Interno: ${r.internalCode.ifBlank { "—" }} | EAN: ${r.code} | Qtd.: ${r.quantity} | ${r.location}" })
+        adapter.addAll(records.mapIndexed { index, r ->
+            if (!useCatalog || (r.internalCode.isBlank() && r.description.isBlank())) {
+                "${index + 1}. ${r.code}"
+            } else {
+                "${index + 1}. ${r.description.ifBlank { "Produto sem descrição" }} | Interno: ${r.internalCode.ifBlank { "—" }} | EAN: ${r.code} | Qtd.: ${r.quantity} | ${r.location}"
+            }
+        })
         adapter.notifyDataSetChanged()
+        updateLastText()
         countText.text = "${companyName.ifBlank { "Inventário" }} — Registros: ${records.size} | Unidades: ${records.sumOf { it.quantity }}"
         if (scrollToNewest && adapter.count > 0) {
             listView.post { listView.smoothScrollToPosition(adapter.count - 1) }

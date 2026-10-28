@@ -7,6 +7,9 @@ import android.graphics.Color
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.view.WindowManager
@@ -37,6 +40,7 @@ import java.io.InputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.Locale
 import android.hardware.camera2.CaptureRequest
 import org.json.JSONArray
 import org.json.JSONObject
@@ -58,7 +62,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var lastText: TextView
     private lateinit var locationText: TextView
     private lateinit var listView: ListView
-    private lateinit var adapter: ArrayAdapter<String>
+    private lateinit var adapter: ArrayAdapter<CharSequence>
     private lateinit var cameraExecutor: ExecutorService
     private var camera: Camera? = null
     // Confirma a mesma leitura em vários quadros antes de registrar.
@@ -96,7 +100,13 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         cameraExecutor = Executors.newSingleThreadExecutor()
         catalogExecutor = Executors.newSingleThreadExecutor()
-        keepScreenOn = appSettingsPrefs.getBoolean("keep_screen_on", false)
+        if (appSettingsPrefs.getInt("functions_defaults_version", 0) < 1) {
+            appSettingsPrefs.edit()
+                .putBoolean("keep_screen_on", true)
+                .putInt("functions_defaults_version", 1)
+                .apply()
+        }
+        keepScreenOn = appSettingsPrefs.getBoolean("keep_screen_on", true)
         toneGenerator = try { ToneGenerator(AudioManager.STREAM_MUSIC, 85) } catch (_: Exception) { null }
         buildUi()
         applyKeepScreenOn()
@@ -111,7 +121,14 @@ class MainActivity : AppCompatActivity() {
                 companyName = labels[which]
                 records.clear()
                 products.clear()
-                useCatalog = prefs.getBoolean("use_catalog", true)
+                if (prefs.getInt("functions_defaults_version", 0) < 1) {
+                    prefs.edit()
+                        .putBoolean("use_catalog", false)
+                        .putBoolean("count_mode", false)
+                        .putInt("functions_defaults_version", 1)
+                        .apply()
+                }
+                useCatalog = prefs.getBoolean("use_catalog", false)
                 countMode = prefs.getBoolean("count_mode", false)
                 updateCatalogToggle()
                 updateCountModeButton()
@@ -448,7 +465,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(lastText, matchWrap())
 
         listView = ListView(this)
-        adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, mutableListOf<String>())
+        adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, mutableListOf<CharSequence>())
         listView.adapter = adapter
         listView.setOnItemLongClickListener { _, _, position, _ ->
             val record = records[position]
@@ -578,8 +595,18 @@ class MainActivity : AppCompatActivity() {
             }.show()
     }
 
+    private fun appendLocation(builder: SpannableStringBuilder, location: String) {
+        val start = builder.length
+        builder.append(location.ifBlank { "Não informado" }.uppercase(Locale.getDefault()))
+        builder.setSpan(ForegroundColorSpan(Color.RED), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+    }
+
     private fun updateLocationText() {
-        if (::locationText.isInitialized) locationText.text = "Local: $currentLocation · toque para editar"
+        if (!::locationText.isInitialized) return
+        val label = SpannableStringBuilder("Local: ")
+        appendLocation(label, currentLocation)
+        label.append(" · toque para editar")
+        locationText.text = label
     }
 
     private fun startCamera() {
@@ -859,6 +886,21 @@ class MainActivity : AppCompatActivity() {
         prefs.edit().putString("records_json", array.toString()).apply()
     }
 
+    private fun formatRecordRow(index: Int, record: ScanRecord): CharSequence {
+        val row = SpannableStringBuilder("${index + 1}. ")
+        if (!useCatalog || (record.internalCode.isBlank() && record.description.isBlank())) {
+            appendLocation(row, record.location)
+            row.append(" | ").append(record.code)
+        } else {
+            row.append(record.description.ifBlank { "Produto sem descrição" })
+                .append(" | Interno: ").append(record.internalCode.ifBlank { "—" }).append(" | ")
+            appendLocation(row, record.location)
+            row.append(" | EAN: ").append(record.code)
+                .append(" | Qtd.: ").append(record.quantity.toString())
+        }
+        return row
+    }
+
     private fun updateLastText() {
         if (!::lastText.isInitialized) return
         val last = records.lastOrNull()
@@ -874,13 +916,7 @@ class MainActivity : AppCompatActivity() {
     private fun refreshList(scrollToNewest: Boolean = false) {
         if (!::adapter.isInitialized) return
         adapter.clear()
-        adapter.addAll(records.mapIndexed { index, r ->
-            if (!useCatalog || (r.internalCode.isBlank() && r.description.isBlank())) {
-                "${index + 1}. ${r.code}"
-            } else {
-                "${index + 1}. ${r.description.ifBlank { "Produto sem descrição" }} | Interno: ${r.internalCode.ifBlank { "—" }} | EAN: ${r.code} | Qtd.: ${r.quantity} | ${r.location}"
-            }
-        })
+        adapter.addAll(records.mapIndexed { index, record -> formatRecordRow(index, record) })
         adapter.notifyDataSetChanged()
         updateLastText()
         countText.text = "${companyName.ifBlank { "Inventário" }} — Registros: ${records.size} | Unidades: ${records.sumOf { it.quantity }}"

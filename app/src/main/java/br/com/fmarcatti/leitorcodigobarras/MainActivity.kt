@@ -375,7 +375,7 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(titleBar, matchWrap())
         val creditLine = TextView(this).apply {
-            text = "Desenvolvido por Francisco Marcatti"
+            text = "Versão ${BuildConfig.VERSION_NAME} • Desenvolvido por Francisco Marcatti"
             textSize = 12f
             setTextColor(Color.GRAY)
             gravity = Gravity.CENTER
@@ -789,13 +789,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun showExportOptions() {
         if (records.isEmpty()) { Toast.makeText(this, "Ainda não há códigos para exportar.", Toast.LENGTH_SHORT).show(); return }
-        val options = arrayOf("TXT — somente códigos", "CSV para Excel — detalhes e quantidade")
+        val options = arrayOf("TXT — local e código de barras", "CSV para Excel — local antes do código de barras")
         AlertDialog.Builder(this).setTitle("Como deseja exportar?").setItems(options) { _, which ->
             when (which) {
-                0 -> shareFile("txt", "codigos.txt", records.joinToString("\n") { it.code })
+                0 -> {
+                    val rows = records.mapIndexed { index, r -> "${index + 1}\t${r.location}\t${r.code}" }
+                    val content = "Empresa: $companyName\nSequência\tLocal\tCódigo de barras\n" + rows.joinToString("\n")
+                    shareFile("txt", "inventario_${companyKey}.txt", content)
+                }
                 1 -> {
-                    val rows = records.mapIndexed { index, r -> "${index + 1};${csv(r.internalCode)};${csv(r.code)};${csv(r.description)};${csv(r.unit)};${csv(r.location)};${r.quantity};${csv(r.format)}" }
-                    shareFile("csv", "inventario_${companyKey}.csv", "Empresa;Nº;Código interno;Código de barras;Descrição;Unidade;Local;Quantidade;Formato\n" + rows.joinToString("\n") { "$companyName;$it" })
+                    val header = "Empresa;Nº;Local;Código de barras;Código interno;Descrição;Unidade;Quantidade;Formato"
+                    val rows = records.mapIndexed { index, r ->
+                        listOf(companyName, (index + 1).toString(), r.location, r.code, r.internalCode, r.description, r.unit, r.quantity.toString(), r.format)
+                            .joinToString(";") { csv(it) }
+                    }
+                    shareFile("csv", "inventario_${companyKey}.csv", header + "\n" + rows.joinToString("\n"))
                 }
             }
         }.show()

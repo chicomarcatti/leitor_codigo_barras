@@ -7,6 +7,10 @@ android {
     namespace = "br.com.fmarcatti.leitorcodigobarras"
     compileSdk = 35
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -16,8 +20,8 @@ android {
         applicationId = "br.com.fmarcatti.leitorcodigobarras"
         minSdk = 23
         targetSdk = 35
-        versionCode = 4
-        versionName = "2.2"
+        versionCode = 5
+        versionName = "2.3"
     }
 }
 
